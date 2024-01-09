@@ -1,3 +1,5 @@
+use main function for execution.
+
 # lenslessholography
 Reconstruction, Phase Unwrapping, Visualization codes for Lensless Inline Holographic Microscopy
 
