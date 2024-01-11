@@ -1,7 +1,7 @@
 use main function for execution.
 
 # lenslessholography
-Reconstruction, Phase Unwrapping, Visualization codes for Lensless Inline Holographic Microscopy
+Reconstruction, Phase Unwrapping, Autofocusing codes for Lensless Inline Holographic Microscopy
 
 # further to include
 Gerchberg Saxton Twin Phase Elimination
