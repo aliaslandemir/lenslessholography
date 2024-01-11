@@ -4,7 +4,7 @@ use main function for execution.
 Reconstruction, Phase Unwrapping, Visualization codes for Lensless Inline Holographic Microscopy
 
 # further to include
-Gerchberg Saxton Twin Phase Elimination, Autofocusing
+Gerchberg Saxton Twin Phase Elimination
 
 # credits
 1 - Latychevskaia, T., & Fink, H.-W. (2015). Practical algorithms for simulation and reconstruction of digital in-line holograms. Applied Optics, 54(9), 2424-2434.
