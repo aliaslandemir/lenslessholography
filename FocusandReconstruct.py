@@ -1,10 +1,9 @@
-# main.py
-
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from skimage.restoration import unwrap_phase
+import time
 
 # Functions
 
@@ -79,6 +78,10 @@ def reconstruct_and_plot(N, lambda_val, area, best_focus, alpha, beta, mask, hol
     plt.savefig(f'best_focus_subplot_{int(best_focus*1e6)}um.png')
     plt.show()
 
+# Measure total processing time
+start_time_total = time.time()
+
+
 # PARAMETERS
 N = 200
 lambda_val = 530e-9
@@ -100,3 +103,6 @@ print(f'Best focus found at z = {best_focus} with phase value of = {best_phase_r
 
 # Reconstruct and display the images at the best focus
 reconstruct_and_plot(N, lambda_val, area, best_focus, alpha, beta, mask, hologram_FT, f1)
+
+end_time_total = time.time()
+print(f'Total processing time: {end_time_total - start_time_total:.2f} seconds')
