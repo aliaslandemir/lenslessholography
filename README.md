@@ -1,12 +1,25 @@
-use main function for execution.
+# Inline Holography Reconstruction
 
-# lenslessholography
-Reconstruction, Phase Unwrapping, Autofocusing codes for Lensless Inline Holographic Microscopy
+This project provides a PyQt-based GUI for reconstructing inline holography data. The application supports advanced phase retrieval, twin-image filtering, autofocus, and visualization tools.
 
-# further to include
-Gerchberg Saxton Twin Phase Elimination
+## Features
+- Angular Spectrum and Fresnel propagation methods.
+- Iterative phase retrieval with positivity and finite support constraints.
+- Adaptive thresholding during reconstruction.
+- 3D deconvolution (placeholder Wiener filter).
+- Twin-image suppression using Fourier domain filtering.
+- Autofocus by maximizing phase range.
+- Line profile comparisons for amplitude and phase.
 
-# credits
-1 - Latychevskaia, T., & Fink, H.-W. (2015). Practical algorithms for simulation and reconstruction of digital in-line holograms. Applied Optics, 54(9), 2424-2434.
+## Requirements
+- Python 3.8+
+- PyQt5
+- NumPy
+- Matplotlib
+- Pillow
+- scikit-image
 
-2 - Herráez, M. A., Burton, D. R., Lalor, M. J., & Gdeisat, M. A. (2002). Fast two-dimensional phase-unwrapping algorithm based on sorting by reliability following a noncontinuous path. Applied Optics, 41(35), 7437-7444.
+## Installation
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/<YourGitHubUsername>/<YourRepoName>.git
