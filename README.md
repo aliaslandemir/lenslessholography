@@ -1,72 +1,91 @@
 # Inline Holography Reconstruction
 
-This project provides a PyQt-based GUI for inline holography reconstruction. It supports both **direct** and **iterative phase retrieval** methods for reconstructing amplitude and phase from holograms. The GUI enables scientists and researchers to analyze holograms with customizable parameters, constraints, and visualization tools.
+
+A **PyQt5-based interactive GUI** for **inline lensless holography reconstruction**.  
+Supports both **direct** (Angular Spectrum / Fresnel) and **iterative** (Gerchberg–Saxton / HIO) phase retrieval, with autofocus, twin-image suppression, adaptive constraints, metrics, and publication-ready visualizations.
 
 ---
 
-## What Does This Code Do?
+## ✨ Key Features
 
-The application allows users to:
+### 1. Hologram Input & Preprocessing
+- Load holograms in **PNG, JPG, BMP, TIF/TIFF** formats.
+- **Extrapolation**: Zero or random padding to recover missing boundaries.
+- Optional **Twin-Image Filtering** via Fourier sideband filtering.
 
-1. **Load a Hologram**: Load a hologram image in standard formats (e.g., PNG, JPG, TIF).
-2. **Direct Reconstruction**: Use the **Angular Spectrum** or **Fresnel propagation** to reconstruct amplitude and phase directly.
-3. **Iterative Phase Retrieval**: Apply **Gershberg-Saxton-like** iterations with constraints to suppress twin images and enhance reconstruction:
-   - **Positivity Enforcement**: Enforces non-negative amplitude in the object plane.
-   - **Finite Support**: Limits reconstruction to a specific spatial region (adaptive support threshold available).
-   - **Phase Extrapolation**: Pads the hologram with zeros or random noise to recover missing boundary information.
-4. **Autofocus**: Perform a brute-force search for the propagation distance (**z**) that maximizes the unwrapped phase range.
-5. **Twin-Image Filtering**: Suppress twin images using Fourier domain filtering.
-6. **3D Deconvolution (Placeholder)**: Enhance resolution using a simple Wiener-like filter (demonstrates potential for iterative 3D deconvolution).
-7. **Visualization**:
-   - Compare **Direct** vs. **Iterative Reconstruction** results in a **2×3 grid** of subplots (amplitude, wrapped phase, and unwrapped phase).
-   - Analyze **line profiles** in a **2×2 grid**, including comparisons of amplitude, wrapped phase, and unwrapped phase.
+### 2. Direct Reconstruction
+- **Angular Spectrum** or **Fresnel propagation**.
+- Adjustable:
+  - Wavelength
+  - Field-of-view (FOV) size
+  - Propagation distance `z`
+
+### 3. Iterative Phase Retrieval
+- Methods: **Gerchberg–Saxton (GS)** and **Hybrid Input-Output (HIO)**.
+- Constraints:
+  - **Positivity enforcement** (amplitude ≥ 0)
+  - **Finite support mask** (percentile, Otsu, or fixed threshold)
+  - **Adaptive support threshold** with morphological dilation
+- Adjustable iteration count and HIO `β` parameter.
+
+### 4. Autofocus
+- Brute-force scan over a `z` range.
+- Focus metrics:
+  - **Unwrapped phase range**
+  - **Laplacian variance** (amplitude sharpness)
+- Auto-updates reconstruction `z`.
+
+### 5. Visualization
+- **3×4 publication-ready grid**:
+  - Row 1: Direct — Amplitude / Wrapped / Unwrapped / Fourier magnitude
+  - Row 2: Iterative — Amplitude / Wrapped / Unwrapped / Fourier magnitude
+  - Row 3: Differences — ΔAmplitude / ΔWrapped / ΔUnwrapped / Iterative phase histogram
+- **Linked color scales** for fair comparison.
+- **Interactive line profiles**: Click anywhere to view amplitude & phase profiles through that point.
+
+### 6. Quantitative Metrics
+- RMSE (amplitude)
+- SSIM (amplitude)
+- Phase correlation (unwrapped phase)
+- Support coverage
+- Valid mask coverage
+
+### 7. Export
+- Save figure as PNG/TIFF.
+- Optionally save:
+  - Reconstructed fields (`.npz`)
+  - Parameters (`.json`)
+  - Metrics table (`.csv`)
 
 ---
 
-## Screenshots
+## 📸 Screenshots
 
-### Main Application
+**Main Application:**
 ![Main Application](docs/screenshot.png)
 
----
-
-## Features
-
-### Direct Reconstruction
-- Supports **Angular Spectrum** and **Fresnel propagation** models.
-- Adjustable parameters for the wavelength, hologram size, and propagation distance.
-
-### Iterative Phase Retrieval
-- Flexible iteration count (`max_iter`) with constraints:
-  - **Positivity Threshold**: Force amplitude ≥ 0.
-  - **Support Threshold**: Create a mask based on amplitude thresholds and morphological dilation.
-  - **Adaptive Thresholding**: Dynamically relax the support threshold over iterations.
-
-### Autofocus
-- Brute-force scan over a user-defined range of `z` values to find the best focus.
-- Automatically updates reconstruction parameters for the optimal focus distance.
-
-### Visualization
-- **Main 2×3 Plot**: Direct and iterative reconstruction results for amplitude, wrapped phase, and unwrapped phase.
-- **Line Profile Window**: 2×2 comparison of amplitude and phase profiles (wrapped and unwrapped).
+**Interactive Profiles:**
+![Profiles Window](docs/profiles.png)
 
 ---
 
-## Installation
+## 🛠 Installation
 
 ### Prerequisites
-- Python 3.8 or higher
-- Virtual Environment (optional but recommended)
+- Python **3.8+**
+- `git`
+- Recommended: virtual environment (`venv`)
 
-### Setup Instructions
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/aliaslandemir/lenslessholography.git
+### Clone & Install
+```bash
+cd C:\Users\aliad\github
+git clone https://github.com/aliaslandemir/lenslessholography.git
+cd lenslessholography
 
+# Create virtual environment
+python -m venv .venv
+.venv\Scripts\activate  # Windows
+# source .venv/bin/activate  # Linux/Mac
 
-
----
-
-## License
-
-This project is licensed under the [MIT License](License). You are free to use, modify, and distribute this software under the terms of the license.
+# Install dependencies
+pip install -r requirements.txt

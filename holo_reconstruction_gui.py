@@ -1,788 +1,972 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Lensless Inline Holography Reconstruction GUI
+Advanced Inline Holography Reconstruction GUI
+=============================================
+- PyQt5 + Matplotlib, single-file GUI
+- Direct propagation (Angular Spectrum / Fresnel)
+- Iterative phase retrieval (GS / HIO) with positivity & finite support
+- Adaptive support threshold and morphological dilation
+- Twin-image (sideband) filter (naive band-pass)
+- Autofocus (metric: unwrapped phase range OR Laplacian variance sharpness)
+- Linked, publication-grade 3x4 figure:
+    Row 1: Direct — Amp / Wrapped / Unwrapped / Fourier |E| of object
+    Row 2: Iterative — Amp / Wrapped / Unwrapped / Fourier |E| of object
+    Row 3: Differences — ΔAmp / ΔWrapped / ΔUnwrapped / Phase histogram (iter)
+- Interactive line profiles: click anywhere to update overlaid row/column profiles
+- Metrics: RMSE (amp), SSIM (amp), Phase corr. (unwrapped), support coverage
+- Export: PNG/TIFF figure, NPZ fields, JSON params, CSV metrics
 
+Dependencies:
+  Python >= 3.8
+  numpy, matplotlib, pillow, scikit-image, PyQt5
 
-This script provides a PyQt-based GUI for loading a single-plane hologram,
-performing either Angular Spectrum or Fresnel propagation, and iteratively
-retrieving phase with additional constraints (positivity, finite support).
-It supports zero or random padding (phase extrapolation), optional twin-image
-filtering, autofocus, and optional 3D deconvolution.
-
-Features:
-- Angular/Fresnel propagator
-- Positivity & finite support constraints
-- Adaptive support threshold (optional)
-- 3D Deconvolution (placeholder Wiener filter)
-- 2×3 subplot for amplitude & phase (wrapped/unwrapped) comparisons
-- Separate line-profile window with 2×2 subplots comparing direct vs. iterative reconstructions:
-  1) Amplitude profiles
-  2) Wrapped phase profiles
-  3) Unwrapped phase profiles
-  4) (Optional) amplitude difference or any other user-defined data
-
-Usage:
+Run:
   python advanced_holography_gui.py
 """
 
+import json
 import sys
+import time
+import math
 import numpy as np
+from dataclasses import dataclass, asdict
+
+from PIL import Image
+from skimage.restoration import unwrap_phase
+from skimage.morphology import binary_dilation, disk
+from skimage.filters import threshold_otsu
+from skimage.metrics import structural_similarity as ssim
+
 import matplotlib
 matplotlib.use("Qt5Agg")
-
 from matplotlib import pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
-from PIL import Image
-
-from skimage.restoration import unwrap_phase
-from skimage.morphology import binary_dilation, disk
-
+from PyQt5.QtCore import Qt, QPoint
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QGroupBox, QVBoxLayout,
-    QHBoxLayout, QPushButton, QLabel, QFileDialog, QDoubleSpinBox,
-    QSpinBox, QMessageBox, QCheckBox, QComboBox
+    QApplication, QMainWindow, QWidget, QGroupBox, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QFileDialog, QDoubleSpinBox, QSpinBox, QMessageBox,
+    QCheckBox, QComboBox, QTabWidget, QTableWidget, QTableWidgetItem, QDockWidget,
+    QLineEdit
 )
-from PyQt5.QtCore import Qt
 
-###############################################################################
-# 1) FFT Utilities
-###############################################################################
+# -------------------------------
+# FFT helpers (centered versions)
+# -------------------------------
 
-def precompute_ft_terms(Nx, Ny):
-    """
-    Precompute a phase factor for "centered" FFT/iFFT.
-    This factor is multiplied before and after transforms
-    to emulate a shift to/from the image center.
-    """
-    x = np.arange(Nx)
-    y = np.arange(Ny)
-    return np.exp(1j * np.pi * (x[:, None] + y))
+def fft2c(x):
+    return np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(x)))
 
-def FT2Dc(in_val, f1):
-    """2D centered FFT."""
-    return f1 * np.fft.fft2(f1 * in_val)
+def ifft2c(X):
+    return np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(X)))
 
-def IFT2Dc(in_val, f1):
-    """2D centered IFFT."""
-    return f1 * np.fft.ifft2(f1 * in_val)
+# -------------------------------
+# Propagators
+# -------------------------------
 
-###############################################################################
-# 2) Propagation Methods (Angular Spectrum or Fresnel)
-###############################################################################
-
-def precompute_propagator_constants(N, lambda_val, area):
-    """
-    Precompute alpha, beta, and a mask for the Angular Spectrum approach.
-    (Assumes Nx=Ny=N.)
-    """
-    coords = np.arange(N) - N // 2
-    alpha = coords / area * lambda_val
-    beta  = coords / area * lambda_val
-    
-    alpha = alpha.reshape(-1, 1)  # Nx x 1
-    beta  = beta.reshape(1, -1)   # 1 x N
-    
-    # Mask for valid spatial frequencies (circle in alpha-beta space)
-    mask = (alpha**2 + beta**2) <= 1.0
-    return alpha, beta, mask
-
-def propagator_angular_spectrum(N, lambda_val, area, z, alpha, beta, mask):
-    """
-    Returns the angular-spectrum propagator for distance z.
-    """
-    inside = 1.0 - (alpha**2 + beta**2)
-    inside[inside < 0] = 0  # clamp negatives
-    phase_term = -2j * np.pi * z * np.sqrt(inside) / lambda_val
-    Pz = np.exp(phase_term) * mask
-    return Pz
-
-def propagator_fresnel(N, lambda_val, area, z):
-    """
-    Returns a Fresnel propagator kernel for distance z:
-      H(fx,fy) = exp(1j*k*z) * exp(-1j * pi * lambda * z * (fx^2 + fy^2))
-    We fftshift for convenience.
-    """
-    k = 2 * np.pi / lambda_val
-    dx = area / N  # real-space sampling
-    # freq coordinates
-    fx = np.fft.fftfreq(N, d=dx)
+def make_freq_grids(N, dx):
+    fx = np.fft.fftfreq(N, d=dx)  # cycles/m
     fy = np.fft.fftfreq(N, d=dx)
     FX, FY = np.meshgrid(fx, fy)
-    
-    H = np.exp(1j * k * z) * np.exp(-1j * np.pi * lambda_val * z * (FX**2 + FY**2))
-    return np.fft.fftshift(H)
+    return FX, FY
 
-def generate_propagator(N, lambda_val, area, z, alpha, beta, mask, method='angular'):
+def angular_spectrum_kernel(N, wavelength, dx, z, evanescent="zero"):
     """
-    Wrapper that returns the appropriate propagator kernel
-    based on the chosen method.
+    H(fx,fy) = exp(i * kz * z), kz = 2π * sqrt( (1/λ)^2 - fx^2 - fy^2 )
+    If evanescent='zero', drop evanescent components (where fx^2+fy^2 > (1/λ)^2).
     """
-    if method.lower() == 'angular':
-        return propagator_angular_spectrum(N, lambda_val, area, z, alpha, beta, mask)
-    elif method.lower() == 'fresnel':
-        return propagator_fresnel(N, lambda_val, area, z)
+    FX, FY = make_freq_grids(N, dx)
+    k = 2 * np.pi / wavelength
+    kx = 2 * np.pi * FX
+    ky = 2 * np.pi * FY
+    k_cut2 = (1.0 / wavelength) ** 2
+
+    mask_prop = (FX**2 + FY**2) <= k_cut2
+    kz = np.zeros_like(FX, dtype=np.complex128)
+    kz[mask_prop] = np.sqrt(np.maximum(0.0, k**2 - kx[mask_prop]**2 - ky[mask_prop]**2))
+    if evanescent == "keep":
+        # decay for evanescent (optional): kz becomes imaginary
+        ev_mask = ~mask_prop
+        kz[ev_mask] = 1j * np.sqrt(kx[ev_mask]**2 + ky[ev_mask]**2 - k**2)
     else:
-        raise ValueError(f"Unsupported propagation method: {method}")
+        # zero-out evanescent
+        pass
 
-###############################################################################
-# 3) Filtering / Preprocessing
-###############################################################################
+    H = np.exp(1j * kz * z)
+    if evanescent != "keep":
+        H[~mask_prop] = 0.0
+    return H
 
-def sideband_filter(hologram):
+def fresnel_kernel(N, wavelength, dx, z):
     """
-    Example twin-image filter: A naive band-pass in Fourier space.
+    H(fx,fy) = exp(i*k*z) * exp(-i*pi*λ*z*(fx^2+fy^2))
     """
-    H = np.fft.fft2(hologram)
-    H_shifted = np.fft.fftshift(H)
-    
-    nx, ny = hologram.shape
-    cx, cy = nx // 2, ny // 2
-    
-    # Example radial band
-    radius_min = 5
-    radius_max = min(cx, cy) // 2
-    
-    X, Y = np.meshgrid(np.arange(ny), np.arange(nx))
-    r2 = (X - cy)**2 + (Y - cx)**2
-    mask = (r2 >= radius_min**2) & (r2 <= radius_max**2)
-    
-    H_shifted[~mask] = 0
-    H_filt = np.fft.ifftshift(H_shifted)
-    
-    holo_filtered = np.fft.ifft2(H_filt)
-    return np.abs(holo_filtered)
+    k = 2 * np.pi / wavelength
+    FX, FY = make_freq_grids(N, dx)
+    H = np.exp(1j * k * z) * np.exp(-1j * np.pi * wavelength * z * (FX**2 + FY**2))
+    return H
 
-###############################################################################
-# 4) Advanced Constraints & 3D Deconvolution
-###############################################################################
+# -------------------------------
+# Filters / preprocessing
+# -------------------------------
 
-def generate_object_support(amp_obj, threshold, dilation_radius):
+def twin_image_sideband_filter(img, rmin=5, rmax_frac=0.45):
     """
-    Create a binary support mask in the object plane
-    by thresholding amplitude and (optionally) applying morphological dilation.
+    Naive radial band-pass in Fourier domain to suppress DC & very-high-freqs.
     """
-    mask = amp_obj > threshold
-    if dilation_radius > 0:
-        mask = binary_dilation(mask, disk(dilation_radius))
-    return mask
+    X = fft2c(img)
+    N, M = img.shape
+    cy, cx = N // 2, M // 2
+    yy, xx = np.ogrid[:N, :M]
+    r2 = (yy - cy)**2 + (xx - cx)**2
+    rmax = int(min(cy, cx) * rmax_frac)
+    mask = (r2 >= rmin**2) & (r2 <= rmax**2)
+    Xf = np.zeros_like(X)
+    Xf[mask] = X[mask]
+    return np.abs(ifft2c(Xf))
 
-def apply_3d_deconvolution(field_obj, wiener_param=1e-3):
-    """
-    Placeholder for advanced 3D deconvolution/resolution enhancement.
-    Demonstrates a simple Wiener-like filter in Fourier space:
-        E_deconv = IFFT( FFT(E) / (OTF + wiener_param) )
-    Here, OTF=1 for demonstration, so E_deconv = E / (1 + wiener_param).
-    """
-    F = np.fft.fft2(field_obj)
-    F_deconv = F / (1.0 + wiener_param)
-    return np.fft.ifft2(F_deconv)
+# -------------------------------
+# Support mask
+# -------------------------------
 
-###############################################################################
-# 5) Iterative Phase Retrieval
-###############################################################################
+def make_support(amp, mode="percentile", thresh_val=10.0, percentile=90.0, dilation=2):
+    """
+    mode:
+      - "percentile": threshold at given percentile of amplitude
+      - "otsu": Otsu threshold on amplitude
+      - "fixed": fixed absolute threshold (thresh_val)
+    """
+    if mode == "percentile":
+        t = np.percentile(amp, percentile)
+    elif mode == "otsu":
+        t = threshold_otsu(amp / (amp.max() + 1e-12)) * (amp.max() + 1e-12)
+    elif mode == "fixed":
+        t = float(thresh_val)
+    else:
+        t = np.percentile(amp, 90.0)
 
-def iterative_phase_retrieval(
-    holo_amp,
-    f1,
-    Pz_forward,
-    Pz_backward,
-    max_iter=10,
-    positivity_enforce=True,
-    support_threshold=0.0,
-    dilation_radius=0,
-    adaptive_threshold=False
-):
+    mask = amp > t
+    if dilation > 0:
+        mask = binary_dilation(mask, disk(int(dilation)))
+    return mask, float(t)
+
+# -------------------------------
+# Autofocus metrics
+# -------------------------------
+
+def laplacian_variance(image):
+    # simple focus proxy on amplitude; expects float
+    # using numpy 2D laplacian kernel
+    kern = np.array([[0, 1, 0],
+                     [1,-4, 1],
+                     [0, 1, 0]], dtype=np.float32)
+    from scipy.signal import convolve2d
+    L = convolve2d(image, kern, mode='same', boundary='symm')
+    return float(L.var())
+
+def autofocus_metric(field, metric="phase_range"):
     """
-    A Gershberg–Saxton-like iterative phase retrieval with constraints:
-      - positivity_enforce: ensures amplitude >= 0
-      - support_threshold + dilation_radius: finite support in object plane
-      - adaptive_threshold: reduces threshold each iteration
+    field: complex object-plane field
     """
-    Nx, Ny = holo_amp.shape
-    
-    # Start with random phase in hologram plane
-    phase_init = 2.0 * np.pi * np.random.rand(Nx, Ny)
-    Eholo = holo_amp * np.exp(1j * phase_init)
-    
-    current_threshold = support_threshold
-    
-    for _ in range(max_iter):
-        # Forward: Hologram plane -> Object plane
-        Eobj = IFT2Dc(FT2Dc(Eholo, f1) * Pz_forward, f1)
-        
-        # Apply constraints
-        amp_obj = np.abs(Eobj)
-        phase_obj = np.angle(Eobj)
-        
-        # Positivity
-        if positivity_enforce:
-            amp_obj[amp_obj < 0] = 0
-        
-        # Finite support
-        if current_threshold > 0:
-            support_mask = generate_object_support(amp_obj, current_threshold, dilation_radius)
-            amp_obj[~support_mask] = 0
-        
-        Eobj = amp_obj * np.exp(1j * phase_obj)
-        
-        # Backward: Object plane -> Hologram plane
-        Eholo_back = IFT2Dc(FT2Dc(Eobj, f1) * Pz_backward, f1)
-        
-        # Enforce known amplitude in hologram plane
+    if metric == "phase_range":
+        ph = np.angle(field)
+        uw = unwrap_phase(ph)
+        return float(uw.max() - uw.min())
+    else:
+        amp = np.abs(field)
+        return laplacian_variance(amp)
+
+# -------------------------------
+# Iterative Retrieval (GS / HIO)
+# -------------------------------
+
+@dataclass
+class IterSettings:
+    method: str = "GS"          # "GS" or "HIO"
+    max_iter: int = 50
+    beta: float = 0.9           # only for HIO
+    positivity: bool = True
+    support_mode: str = "percentile"  # "percentile"|"otsu"|"fixed"
+    support_thresh: float = 10.0
+    support_percentile: float = 90.0
+    dilation: int = 2
+    adaptive_support: bool = True
+    adaptive_rate: float = 0.97  # multiplicative decay per iter for threshold
+
+def iterative_reconstruction(holo_amp, Hfwd, Hbwd, settings: IterSettings):
+    """
+    holo_amp: measured amplitude at hologram plane (sqrt of hologram intensity)
+    Hfwd/Hbwd: transfer functions for forward/backward
+    """
+    N, M = holo_amp.shape
+    rng = np.random.default_rng(0)
+    phase0 = rng.uniform(-np.pi, np.pi, size=(N, M))
+    Eholo = holo_amp * np.exp(1j * phase0)
+
+    Eobj_prev = None
+    support = None
+    support_thresh = settings.support_thresh
+
+    # precompute support every iter
+    for it in range(settings.max_iter):
+        # hologram -> object
+        Eobj = ifft2c(fft2c(Eholo) * Hfwd)
+
+        # constraints in object plane
+        amp = np.abs(Eobj)
+        pha = np.angle(Eobj)
+
+        if support is None:
+            support, used_t = make_support(
+                amp,
+                mode=settings.support_mode,
+                thresh_val=settings.support_thresh,
+                percentile=settings.support_percentile,
+                dilation=settings.dilation
+            )
+            support_thresh = used_t
+
+        # optional adaptive support (gradually relax threshold)
+        if settings.adaptive_support and (it > 0) and (settings.support_mode != "fixed"):
+            if settings.support_mode == "percentile":
+                # slowly lower percentile toward 80
+                settings.support_percentile = max(80.0, settings.support_percentile * settings.adaptive_rate)
+            else:
+                support_thresh *= settings.adaptive_rate
+            support, _ = make_support(
+                amp,
+                mode=settings.support_mode,
+                thresh_val=support_thresh,
+                percentile=settings.support_percentile,
+                dilation=settings.dilation
+            )
+
+        # positivity (on amplitude – trivial non-negativity) + zero outside support
+        if settings.method.upper() == "GS":
+            if settings.positivity:
+                amp = np.clip(amp, 0, None)
+            amp[~support] = 0.0
+            Eobj_new = amp * np.exp(1j * pha)
+
+        elif settings.method.upper() == "HIO":
+            if Eobj_prev is None:
+                Eobj_prev = Eobj.copy()
+            # Inside support: enforce positivity
+            Ein = Eobj.copy()
+            if settings.positivity:
+                Ein = np.clip(np.abs(Ein), 0, None) * np.exp(1j * np.angle(Ein))
+            # HIO outside support
+            Eout = Eobj_prev[~support] - settings.beta * Eobj[~support]
+            Eobj_new = Eobj.copy()
+            Eobj_new[support] = Ein[support]
+            Eobj_new[~support] = Eout
+            Eobj_prev = Eobj_new.copy()
+
+        else:
+            raise ValueError("Unknown iterative method")
+
+        # object -> hologram and enforce measured amplitude
+        Eholo_back = ifft2c(fft2c(Eobj_new) * Hbwd)
         Eholo = holo_amp * np.exp(1j * np.angle(Eholo_back))
-        
-        # Adaptive threshold (optional)
-        if adaptive_threshold and current_threshold > 0:
-            current_threshold *= 0.95  # e.g. reduce threshold by 5% each iteration
-    
-    return Eobj
 
-###############################################################################
-# 6) PyQt5 Visualization Classes
-###############################################################################
+    return Eobj_new, support
 
-class MplCanvas(FigureCanvas):
-    """
-    A Matplotlib canvas with 2 rows x 3 columns of subplots:
-      Top row   : direct reconstruction (amplitude, wrapped phase, unwrapped phase)
-      Bottom row: iterative reconstruction (amplitude, wrapped phase, unwrapped phase)
-    """
-    def __init__(self, parent=None, width=12, height=8, dpi=100):
-        fig = Figure(figsize=(width, height), dpi=dpi)
-        axes = fig.subplots(2, 3)
-        
-        self.fig = fig
-        self.ax_amp_direct   = axes[0, 0]
-        self.ax_wp_direct    = axes[0, 1]
-        self.ax_uwp_direct   = axes[0, 2]
-        
-        self.ax_amp_iter     = axes[1, 0]
-        self.ax_wp_iter      = axes[1, 1]
-        self.ax_uwp_iter     = axes[1, 2]
-        
-        super().__init__(fig)
+# -------------------------------
+# Metrics
+# -------------------------------
+
+def safe_norm(a):
+    m = a.max() - a.min()
+    if m <= 1e-12:
+        return a*0
+    return (a - a.min()) / m
+
+def compute_metrics(amp_d, amp_i, uwp_d, uwp_i, support):
+    # RMSE amplitude
+    rmse = float(np.sqrt(np.mean((amp_d - amp_i)**2)))
+    # SSIM amplitude (normalize to [0,1])
+    A1 = safe_norm(amp_d)
+    A2 = safe_norm(amp_i)
+    ssim_val = float(ssim(A1, A2, data_range=1.0))
+    # Phase correlation on unwrapped phase (mask finite & support)
+    mask = np.isfinite(uwp_d) & np.isfinite(uwp_i)
+    if support is not None:
+        mask &= support
+    if mask.sum() > 10:
+        p1 = uwp_d[mask].ravel()
+        p2 = uwp_i[mask].ravel()
+        # Pearson correlation
+        p1 = (p1 - p1.mean()) / (p1.std() + 1e-12)
+        p2 = (p2 - p2.mean()) / (p2.std() + 1e-12)
+        corr = float(np.mean(p1 * p2))
+    else:
+        corr = float("nan")
+    cov = float(mask.mean()) if mask.size else 0.0
+    sup_cov = float(support.mean()) if support is not None else float("nan")
+    return {
+        "rmse_amp": rmse,
+        "ssim_amp": ssim_val,
+        "phase_corr_unwrapped": corr,
+        "valid_mask_coverage": cov,
+        "support_coverage": sup_cov,
+    }
+
+# -------------------------------
+# Main Canvas (3x4 grid + interactivity)
+# -------------------------------
+
+class ReconCanvas(FigureCanvas):
+    def __init__(self, parent=None, width=12, height=9, dpi=100):
+        self.fig = Figure(figsize=(width, height), dpi=dpi, constrained_layout=True)
+        axs = self.fig.subplots(3, 4, sharex=True, sharey=True)
+        self.axs = axs
+        super().__init__(self.fig)
         self.setParent(parent)
-        self.fig.tight_layout()
 
-class LineProfileWindow(QWidget):
-    """
-    A separate window to display 2×2 line profiles:
-      - Top-left:  Amplitude (direct vs. iterative)
-      - Top-right: Wrapped phase (direct vs. iterative)
-      - Bottom-left: Unwrapped phase (direct vs. iterative)
-      - Bottom-right: (Optional) difference or another comparison
-    """
-    def __init__(self, amp_direct, phase_direct, amp_iter, phase_iter, unwrap_direct, unwrap_iter):
-        super().__init__()
-        self.setWindowTitle("Line Profile Comparisons")
-        
-        layout = QVBoxLayout(self)
-        
-        self.fig = Figure(figsize=(8, 8))
-        self.canvas = FigureCanvas(self.fig)
-        layout.addWidget(self.canvas)
-        
-        ax = []
-        ax.append(self.fig.add_subplot(2, 2, 1))  # amplitude
-        ax.append(self.fig.add_subplot(2, 2, 2))  # wrapped phase
-        ax.append(self.fig.add_subplot(2, 2, 3))  # unwrapped phase
-        ax.append(self.fig.add_subplot(2, 2, 4))  # optional difference or another metric
-        
-        # Create row-center line profiles
-        Nx = amp_direct.shape[0]
-        Ny = amp_direct.shape[1]
-        row_center = Nx // 2
-        
-        # 1) Amplitude line profile
-        profile_amp_direct = amp_direct[row_center, :]
-        profile_amp_iter   = amp_iter[row_center, :]
-        
-        # 2) Wrapped phase line profile
-        profile_phase_direct = phase_direct[row_center, :]
-        profile_phase_iter   = phase_iter[row_center, :]
-        
-        # 3) Unwrapped phase line profile
-        profile_uwp_direct = unwrap_direct[row_center, :]
-        profile_uwp_iter   = unwrap_iter[row_center, :]
-        
-        # --- Top-left: Amplitude ---
-        ax[0].plot(profile_amp_direct, 'b-', label='Direct Amp')
-        ax[0].plot(profile_amp_iter,   'r--', label='Iter Amp')
-        ax[0].set_title("Amplitude Profile")
-        ax[0].legend()
-        
-        # --- Top-right: Wrapped Phase ---
-        ax[1].plot(profile_phase_direct, 'b-', label='Direct Wrapped')
-        ax[1].plot(profile_phase_iter,   'r--', label='Iter Wrapped')
-        ax[1].set_title("Wrapped Phase Profile")
-        ax[1].legend()
-        
-        # --- Bottom-left: Unwrapped Phase ---
-        ax[2].plot(profile_uwp_direct, 'b-', label='Direct Unwrapped')
-        ax[2].plot(profile_uwp_iter,   'r--', label='Iter Unwrapped')
-        ax[2].set_title("Unwrapped Phase Profile")
-        ax[2].legend()
-        
-        # --- Bottom-right: Optional difference or 2D correlation, etc.
-        # For demonstration, let's do amplitude difference
-        difference_amp = profile_amp_direct - profile_amp_iter
-        ax[3].plot(difference_amp, 'k-', label='Amp Diff (Dir - Iter)')
-        ax[3].set_title("Amplitude Difference")
-        ax[3].legend()
-        
-        self.fig.tight_layout()
-        self.canvas.draw()
-
-###############################################################################
-# 7) Main PyQt5 GUI
-###############################################################################
-
-class HoloReconstructionApp(QMainWindow):
-    """
-    Main Window for advanced lensless holography reconstruction.
-    """
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Advanced Inline Holography Reconstruction")
-        
-        # Default parameters
-        self.N = 200
-        self.lambda_val = 530e-9  # 530 nm
-        self.area = 1.5e-3       # 1.5 mm
-        self.hologram = None
-        self.hologram_filtered = None
-        self.hologram_FT = None
-        
-        # Propagation method
-        self.propagation_method = 'angular'
-        
-        # Precompute for Nx=Ny=200
-        self.f1 = precompute_ft_terms(self.N, self.N)
-        self.alpha, self.beta, self.mask = precompute_propagator_constants(
-            self.N, self.lambda_val, self.area
-        )
-        
-        # Data references (for line profiles)
-        self.amp_direct = None
-        self.phase_direct = None
-        self.amp_iter = None
-        self.phase_iter = None
-        self.unwrap_direct = None
-        self.unwrap_iter = None
-        
-        # Build UI
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
-        
-        # Left: Control panel
-        control_panel = self.create_control_panel()
-        # Right: Plot canvas
-        self.canvas = MplCanvas(self, width=12, height=8)
-        
-        main_layout.addWidget(control_panel, 1)
-        main_layout.addWidget(self.canvas, 3)
-        
+        self.cid = self.fig.canvas.mpl_connect("button_press_event", self.on_click)
+        self._profiles_callback = None
+        self._last_images = {}  # store images for colorbars etc.
         self.colorbars = []
-    
-    def create_control_panel(self):
-        panel = QGroupBox("Controls")
-        layout = QVBoxLayout()
-        
-        # 1) Load hologram + extrapolation
-        btn_load = QPushButton("Load Hologram")
-        btn_load.clicked.connect(self.load_hologram)
-        
-        lbl_extrap = QLabel("Extrapolation Factor:")
-        self.spin_extrap = QSpinBox()
-        self.spin_extrap.setRange(1, 4)
-        self.spin_extrap.setValue(1)
-        
-        lbl_extrap_mode = QLabel("Extrapolation Mode:")
-        self.combo_extrap_mode = QComboBox()
-        self.combo_extrap_mode.addItems(["Zeros", "Random"])
-        
-        # 2) Twin-image filter
-        btn_filter = QPushButton("Twin-Image Filter")
-        btn_filter.clicked.connect(self.run_filter)
-        
-        # 3) Autofocus
-        lbl_zmin = QLabel("z min (m):")
-        self.spin_zmin = QDoubleSpinBox()
-        self.spin_zmin.setRange(1e-6, 0.5)
-        self.spin_zmin.setValue(0.0001)
-        self.spin_zmin.setDecimals(8)
-        
-        lbl_zmax = QLabel("z max (m):")
-        self.spin_zmax = QDoubleSpinBox()
-        self.spin_zmax.setRange(1e-6, 0.5)
-        self.spin_zmax.setValue(0.005)
-        self.spin_zmax.setDecimals(8)
-        
-        lbl_zstep = QLabel("z step (m):")
-        self.spin_zstep = QDoubleSpinBox()
-        self.spin_zstep.setRange(1e-7, 0.1)
-        self.spin_zstep.setValue(0.0001)
-        self.spin_zstep.setDecimals(8)
-        
-        btn_autofocus = QPushButton("Search Best Focus")
-        btn_autofocus.clicked.connect(self.run_autofocus)
-        
-        # 4) Manual z
-        lbl_zmanual = QLabel("Manual z (m):")
-        self.spin_zmanual = QDoubleSpinBox()
-        self.spin_zmanual.setRange(1e-6, 0.5)
-        self.spin_zmanual.setValue(0.005)
-        self.spin_zmanual.setDecimals(8)
-        
-        # 5) Propagation method
-        lbl_prop_method = QLabel("Propagation Method:")
-        self.combo_prop_method = QComboBox()
-        self.combo_prop_method.addItems(["Angular Spectrum", "Fresnel"])
-        self.combo_prop_method.currentIndexChanged.connect(self.update_propagation_method)
-        
-        # 6) Iterations & constraints
-        lbl_iter = QLabel("Max Iterations:")
-        self.spin_iter = QSpinBox()
-        self.spin_iter.setRange(1, 1000)
-        self.spin_iter.setValue(10)
-        
-        lbl_pos_thresh = QLabel("Positivity Threshold:")
-        self.spin_pos_thresh = QDoubleSpinBox()
-        self.spin_pos_thresh.setRange(0.0, 1e5)
-        self.spin_pos_thresh.setValue(0.0)
-        
-        lbl_supp_thresh = QLabel("Support Threshold:")
-        self.spin_supp_thresh = QDoubleSpinBox()
-        self.spin_supp_thresh.setRange(0.0, 1e5)
-        self.spin_supp_thresh.setValue(10.0)
-        
-        lbl_dilation = QLabel("Dilation Radius:")
-        self.spin_dilation = QSpinBox()
-        self.spin_dilation.setRange(0, 50)
-        self.spin_dilation.setValue(2)
-        
-        self.check_adaptive_thresh = QCheckBox("Adaptive Threshold")
-        self.check_3d_deconv = QCheckBox("3D Deconvolution")
-        
-        # 7) Reconstruct
-        btn_reconstruct = QPushButton("Reconstruct @ z")
-        btn_reconstruct.clicked.connect(self.run_reconstruction)
-        
-        # 8) Show line profiles
-        btn_line_profiles = QPushButton("Show Line Profiles")
-        btn_line_profiles.clicked.connect(self.show_line_profiles)
-        
-        # Add to layout
-        layout.addWidget(btn_load)
-        layout.addWidget(lbl_extrap)
-        layout.addWidget(self.spin_extrap)
-        layout.addWidget(lbl_extrap_mode)
-        layout.addWidget(self.combo_extrap_mode)
-        
-        layout.addWidget(btn_filter)
-        
-        layout.addWidget(lbl_zmin)
-        layout.addWidget(self.spin_zmin)
-        layout.addWidget(lbl_zmax)
-        layout.addWidget(self.spin_zmax)
-        layout.addWidget(lbl_zstep)
-        layout.addWidget(self.spin_zstep)
-        layout.addWidget(btn_autofocus)
-        
-        layout.addWidget(lbl_zmanual)
-        layout.addWidget(self.spin_zmanual)
-        
-        layout.addWidget(lbl_prop_method)
-        layout.addWidget(self.combo_prop_method)
-        
-        layout.addWidget(lbl_iter)
-        layout.addWidget(self.spin_iter)
-        
-        layout.addWidget(lbl_pos_thresh)
-        layout.addWidget(self.spin_pos_thresh)
-        
-        layout.addWidget(lbl_supp_thresh)
-        layout.addWidget(self.spin_supp_thresh)
-        
-        layout.addWidget(lbl_dilation)
-        layout.addWidget(self.spin_dilation)
-        
-        layout.addWidget(self.check_adaptive_thresh)
-        layout.addWidget(self.check_3d_deconv)
-        
-        layout.addWidget(btn_reconstruct)
-        layout.addWidget(btn_line_profiles)
-        
-        layout.addStretch()
-        panel.setLayout(layout)
-        return panel
-    
-    def update_propagation_method(self):
-        text = self.combo_prop_method.currentText()
-        if text == "Angular Spectrum":
-            self.propagation_method = 'angular'
-        else:
-            self.propagation_method = 'fresnel'
-    
-    def load_hologram(self):
-        """Load and optionally extrapolate the hologram."""
-        fname, _ = QFileDialog.getOpenFileName(
-            self, "Open Hologram", "",
-            "Images (*.png *.jpg *.bmp *.tif)"
-        )
-        if fname:
-            img = np.array(Image.open(fname)).astype(float)
-            Nx, Ny = img.shape
-            
-            # Extrapolation
-            factor = self.spin_extrap.value()
-            Nx_new = Nx * factor
-            Ny_new = Ny * factor
-            
-            self.N = int(max(Nx_new, Ny_new))
-            
-            # Recompute for new N
-            self.f1 = precompute_ft_terms(self.N, self.N)
-            self.alpha, self.beta, self.mask = precompute_propagator_constants(
-                self.N, self.lambda_val, self.area
-            )
-            
-            holo_padded = np.zeros((self.N, self.N), dtype=float)
-            
-            mode = self.combo_extrap_mode.currentText().lower()
-            if mode == 'random':
-                holo_padded[:] = np.random.rand(self.N, self.N) * np.mean(img)
-            
-            # Center the original in holo_padded
-            start_x = (self.N - Nx) // 2
-            start_y = (self.N - Ny) // 2
-            holo_padded[start_x:start_x+Nx, start_y:start_y+Ny] = img
-            
-            self.hologram = holo_padded
-            self.hologram_filtered = None
-            self.hologram_FT = FT2Dc(self.hologram, self.f1)
-            
-            QMessageBox.information(self, "Load Hologram", f"Loaded {fname}")
-    
-    def run_filter(self):
-        """Apply sideband (twin-image) filter."""
-        if self.hologram is None:
-            QMessageBox.warning(self, "Warning", "No hologram loaded.")
-            return
-        self.hologram_filtered = sideband_filter(self.hologram)
-        QMessageBox.information(self, "Filter", "Twin-image filtering done.")
-    
-    def run_autofocus(self):
-        """Brute-force search for best z by maximizing unwrapped phase range."""
-        if self.hologram is None:
-            QMessageBox.warning(self, "Warning", "No hologram loaded.")
-            return
-        
-        zmin = self.spin_zmin.value()
-        zmax = self.spin_zmax.value()
-        zstep = self.spin_zstep.value()
-        if zstep <= 0:
-            QMessageBox.warning(self, "Invalid Input", "z step must be > 0.")
-            return
-        
-        z_values = np.arange(zmin, zmax, zstep)
-        if len(z_values) < 1:
-            QMessageBox.warning(self, "Invalid Range",
-                                "No valid z-values. Check your min, max, step.")
-            return
-        
-        if self.hologram_filtered is not None:
-            holo_ft = FT2Dc(self.hologram_filtered, self.f1)
-        else:
-            holo_ft = self.hologram_FT
-        
-        best_focus = None
-        best_range = -np.inf
-        
-        for z in z_values:
-            Pz = generate_propagator(
-                self.N, self.lambda_val, self.area, z,
-                self.alpha, self.beta, self.mask,
-                method=self.propagation_method
-            )
-            field_prop = IFT2Dc(holo_ft * Pz, self.f1)
-            phase = np.angle(field_prop)
-            uwp = unwrap_phase(-phase)
-            rng = uwp.max() - uwp.min()
-            if rng > best_range:
-                best_range = rng
-                best_focus = z
-        
-        QMessageBox.information(
-            self, "AutoFocus Results",
-            f"Best focus = {best_focus*1e6:.2f} µm\n"
-            f"Phase range = {best_range:.4f} rad"
-        )
-        
-        self.spin_zmanual.setValue(best_focus)
-        self.run_reconstruction()
-    
-    def run_reconstruction(self):
-        """Perform direct and iterative reconstructions at the chosen z."""
-        if self.hologram is None:
-            QMessageBox.warning(self, "Warning", "No hologram loaded.")
-            return
-        
-        if self.hologram_filtered is not None:
-            holo = self.hologram_filtered
-            holo_ft = FT2Dc(holo, self.f1)
-        else:
-            holo = self.hologram
-            holo_ft = self.hologram_FT
-        
-        z = self.spin_zmanual.value()
-        
-        # Create forward/backward propagators
-        Pz_forward = generate_propagator(
-            self.N, self.lambda_val, self.area, z,
-            self.alpha, self.beta, self.mask,
-            method=self.propagation_method
-        )
-        Pz_backward = generate_propagator(
-            self.N, self.lambda_val, self.area, -z,
-            self.alpha, self.beta, self.mask,
-            method=self.propagation_method
-        )
-        
-        # Direct reconstruction
-        field_prop = IFT2Dc(holo_ft * Pz_forward, self.f1)
-        self.amp_direct = np.abs(field_prop)
-        self.phase_direct = np.angle(field_prop)
-        self.unwrap_direct = unwrap_phase(-self.phase_direct)
-        
-        # Iterative reconstruction
-        holo_amp = np.sqrt(holo)
-        
-        max_iter = self.spin_iter.value()
-        pos_thresh = self.spin_pos_thresh.value()
-        supp_thresh = self.spin_supp_thresh.value()
-        dilation_radius = self.spin_dilation.value()
-        adapt_thresh = self.check_adaptive_thresh.isChecked()
-        
-        Eobj_iter = iterative_phase_retrieval(
-            holo_amp,
-            self.f1,
-            Pz_forward,
-            Pz_backward,
-            max_iter=max_iter,
-            positivity_enforce=(pos_thresh > 0.0),
-            support_threshold=supp_thresh,
-            dilation_radius=dilation_radius,
-            adaptive_threshold=adapt_thresh
-        )
-        
-        # Optional 3D Deconvolution
-        if self.check_3d_deconv.isChecked():
-            Eobj_iter = apply_3d_deconvolution(Eobj_iter, wiener_param=1e-3)
-        
-        self.amp_iter = np.abs(Eobj_iter)
-        self.phase_iter = np.angle(Eobj_iter)
-        self.unwrap_iter = unwrap_phase(-self.phase_iter)
-        
-        # Update the 2×3 matplotlib plots
-        self.update_plots(z)
-    
-    def update_plots(self, z):
-        # Clear old images
-        for ax in [
-            self.canvas.ax_amp_direct,
-            self.canvas.ax_wp_direct,
-            self.canvas.ax_uwp_direct,
-            self.canvas.ax_amp_iter,
-            self.canvas.ax_wp_iter,
-            self.canvas.ax_uwp_iter
-        ]:
+
+    def clear(self):
+        for ax in self.axs.flat:
             ax.clear()
-        
-        # Remove colorbars
         for cb in self.colorbars:
             try:
                 cb.remove()
-            except:
+            except Exception:
                 pass
         self.colorbars = []
-        
-        # ---------- Top Row (Direct) -----------
-        im_amp_d = self.canvas.ax_amp_direct.imshow(self.amp_direct, cmap='gray')
-        self.canvas.ax_amp_direct.set_title(f"Direct Amplitude @ z={1e6*z:.2f} µm")
-        self.canvas.ax_amp_direct.axis("off")
-        cb_d1 = self.canvas.fig.colorbar(im_amp_d, ax=self.canvas.ax_amp_direct,
-                                         fraction=0.046, pad=0.04)
-        self.colorbars.append(cb_d1)
-        
-        im_wp_d = self.canvas.ax_wp_direct.imshow(self.phase_direct, cmap='jet')
-        prange_d = self.phase_direct.max() - self.phase_direct.min()
-        self.canvas.ax_wp_direct.set_title(f"Direct Wrapped\nRange={prange_d:.2f}")
-        self.canvas.ax_wp_direct.axis("off")
-        cb_d2 = self.canvas.fig.colorbar(im_wp_d, ax=self.canvas.ax_wp_direct,
-                                         fraction=0.046, pad=0.04)
-        self.colorbars.append(cb_d2)
-        
-        im_uwp_d = self.canvas.ax_uwp_direct.imshow(self.unwrap_direct, cmap='jet')
-        urange_d = self.unwrap_direct.max() - self.unwrap_direct.min()
-        self.canvas.ax_uwp_direct.set_title(f"Direct Unwrapped\nRange={urange_d:.2f}")
-        self.canvas.ax_uwp_direct.axis("off")
-        cb_d3 = self.canvas.fig.colorbar(im_uwp_d, ax=self.canvas.ax_uwp_direct,
-                                         fraction=0.046, pad=0.04)
-        self.colorbars.append(cb_d3)
-        
-        # ---------- Bottom Row (Iterative) -----------
-        im_amp_i = self.canvas.ax_amp_iter.imshow(self.amp_iter, cmap='gray')
-        self.canvas.ax_amp_iter.set_title("Iterative Amplitude")
-        self.canvas.ax_amp_iter.axis("off")
-        cb_i1 = self.canvas.fig.colorbar(im_amp_i, ax=self.canvas.ax_amp_iter,
-                                         fraction=0.046, pad=0.04)
-        self.colorbars.append(cb_i1)
-        
-        im_wp_i = self.canvas.ax_wp_iter.imshow(self.phase_iter, cmap='jet')
-        prange_i = self.phase_iter.max() - self.phase_iter.min()
-        self.canvas.ax_wp_iter.set_title(f"Iter Wrapped\nRange={prange_i:.2f}")
-        self.canvas.ax_wp_iter.axis("off")
-        cb_i2 = self.canvas.fig.colorbar(im_wp_i, ax=self.canvas.ax_wp_iter,
-                                         fraction=0.046, pad=0.04)
-        self.colorbars.append(cb_i2)
-        
-        im_uwp_i = self.canvas.ax_uwp_iter.imshow(self.unwrap_iter, cmap='jet')
-        urange_i = self.unwrap_iter.max() - self.unwrap_iter.min()
-        self.canvas.ax_uwp_iter.set_title(f"Iter Unwrapped\nRange={urange_i:.2f}")
-        self.canvas.ax_uwp_iter.axis("off")
-        cb_i3 = self.canvas.fig.colorbar(im_uwp_i, ax=self.canvas.ax_uwp_iter,
-                                         fraction=0.046, pad=0.04)
-        self.colorbars.append(cb_i3)
-        
-        self.canvas.fig.tight_layout()
-        self.canvas.draw()
-    
-    def show_line_profiles(self):
-        """Open a separate window with 2×2 line profile plots."""
-        if self.amp_direct is None or self.amp_iter is None:
-            QMessageBox.warning(self, "Warning", "No reconstruction to plot. Please reconstruct first.")
-            return
-        
-        self.line_profile_window = LineProfileWindow(
-            self.amp_direct, self.phase_direct,
-            self.amp_iter, self.phase_iter,
-            self.unwrap_direct, self.unwrap_iter
-        )
-        self.line_profile_window.show()
+        self.draw()
 
-###############################################################################
-# 8) Main Entry Point
-###############################################################################
+    def set_profiles_callback(self, fn):
+        self._profiles_callback = fn
+
+    def on_click(self, event):
+        # Report click in data coords to callback (for line profiles)
+        if event.inaxes in self.axs.flat:
+            if self._profiles_callback is not None:
+                self._profiles_callback(int(round(event.xdata)), int(round(event.ydata)))
+
+    def _show(self, ax, img, title="", cmap="gray", add_cb=True, vmin=None, vmax=None):
+        im = ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax)
+        ax.set_title(title, fontsize=10)
+        ax.axis("off")
+        if add_cb:
+            cb = self.fig.colorbar(im, ax=ax, fraction=0.045, pad=0.03)
+            self.colorbars.append(cb)
+        return im
+
+    def plot_all(self, D_amp, D_wr, D_uw,
+                 I_amp, I_wr, I_uw,
+                 diff_amp, diff_wr, diff_uw,
+                 fftD_mag, fftI_mag, phase_hist,
+                 link_color=True):
+
+        self.clear()
+
+        # Optional linked scales
+        vA = (D_amp.min(), D_amp.max()) if not link_color else (
+            min(D_amp.min(), I_amp.min()), max(D_amp.max(), I_amp.max())
+        )
+        vW = (-np.pi, np.pi)
+        vU = (min(D_uw.min(), I_uw.min()), max(D_uw.max(), I_uw.max())) if link_color else (None, None)
+
+        # Row 1: Direct
+        self._show(self.axs[0,0], D_amp, "Direct Amplitude", "gray", True, *vA)
+        self._show(self.axs[0,1], D_wr, "Direct Wrapped Phase", "twilight", True, *vW)
+        self._show(self.axs[0,2], D_uw, "Direct Unwrapped Phase", "twilight", True, *vU)
+        self._show(self.axs[0,3], fftD_mag, "Direct |FFT(E)|", "magma", True, None, None)
+
+        # Row 2: Iterative
+        self._show(self.axs[1,0], I_amp, "Iterative Amplitude", "gray", True, *vA)
+        self._show(self.axs[1,1], I_wr, "Iterative Wrapped Phase", "twilight", True, *vW)
+        self._show(self.axs[1,2], I_uw, "Iterative Unwrapped Phase", "twilight", True, *vU)
+        self._show(self.axs[1,3], fftI_mag, "Iterative |FFT(E)|", "magma", True, None, None)
+
+        # Row 3: Differences + histogram
+        self._show(self.axs[2,0], diff_amp, "ΔAmplitude (Iter-Direct)", "bwr", True, None, None)
+        self._show(self.axs[2,1], diff_wr, "ΔWrapped Phase (wrap)", "twilight", True, -np.pi, np.pi)
+        self._show(self.axs[2,2], diff_uw, "ΔUnwrapped Phase", "coolwarm", True, None, None)
+
+        # Phase histogram (iterative)
+        axh = self.axs[2,3]
+        axh.clear()
+        axh.hist(phase_hist.ravel(), bins=80)
+        axh.set_title("Iterative Phase Histogram")
+        axh.set_xlabel("Phase [rad]")
+        axh.set_ylabel("Count")
+        axh.grid(True)
+
+        self.draw()
+
+# -------------------------------
+# Main App
+# -------------------------------
+
+class HoloGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Advanced Inline Holography Reconstruction")
+
+        # Data
+        self.hologram = None  # float 2D (intensity)
+        self.filtered = None
+        self.N = 256
+        self.area = 1.5e-3  # meters (FOV length), square assumed
+        self.wavelength = 530e-9
+        self.z = 5e-3
+
+        # Reconstruction fields
+        self.direct_field = None
+        self.iter_field = None
+        self.support = None
+
+        # GUI layout
+        self.canvas = ReconCanvas(self, width=12, height=9)
+        self.setCentralWidget(self.canvas)
+
+        # Controls (tabs in a dock)
+        self.ctrl_dock = QDockWidget("Controls", self)
+        self.ctrl_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.ctrl_dock)
+
+        self.tabs = QTabWidget()
+        self.ctrl_dock.setWidget(self.tabs)
+
+        self._build_tab_input()
+        self._build_tab_prop()
+        self._build_tab_iter()
+        self._build_tab_viz_export()
+
+        # Metrics dock
+        self.metrics_dock = QDockWidget("Metrics", self)
+        self.metrics_table = QTableWidget(0, 2)
+        self.metrics_table.setHorizontalHeaderLabels(["Metric", "Value"])
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.addWidget(self.metrics_table)
+        self.metrics_dock.setWidget(w)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.metrics_dock)
+
+        # Profiles dock
+        self.profiles_dock = QDockWidget("Line Profiles", self)
+        self.profiles_fig = Figure(figsize=(5,4), dpi=100)
+        self.profiles_canvas = FigureCanvas(self.profiles_fig)
+        w2 = QWidget()
+        v2 = QVBoxLayout(w2)
+        v2.addWidget(self.profiles_canvas)
+        self.profiles_dock.setWidget(w2)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.profiles_dock)
+
+        self.canvas.set_profiles_callback(self.update_profiles)
+
+    # ---------------- UI Tabs ----------------
+
+    def _build_tab_input(self):
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+
+        # load
+        btn_load = QPushButton("Load Hologram")
+        btn_load.clicked.connect(self.load_hologram)
+
+        # extrapolation
+        hl = QHBoxLayout()
+        hl.addWidget(QLabel("Extrapolation factor"))
+        self.spin_extrap = QSpinBox()
+        self.spin_extrap.setRange(1, 8)
+        self.spin_extrap.setValue(1)
+        hl.addWidget(self.spin_extrap)
+
+        hl2 = QHBoxLayout()
+        hl2.addWidget(QLabel("Extrapolation mode"))
+        self.combo_extrap = QComboBox()
+        self.combo_extrap.addItems(["Zeros", "Random"])
+        hl2.addWidget(self.combo_extrap)
+
+        # filter
+        btn_filter = QPushButton("Twin-Image Filter")
+        btn_filter.clicked.connect(self.apply_filter)
+
+        # fields
+        lay.addWidget(btn_load)
+        lay.addLayout(hl)
+        lay.addLayout(hl2)
+        lay.addWidget(btn_filter)
+        lay.addStretch()
+
+        self.tabs.addTab(tab, "Input")
+
+    def _build_tab_prop(self):
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+
+        # wavelength
+        h1 = QHBoxLayout()
+        h1.addWidget(QLabel("Wavelength [nm]"))
+        self.spin_lambda = QDoubleSpinBox()
+        self.spin_lambda.setDecimals(3)
+        self.spin_lambda.setRange(200.0, 2000.0)
+        self.spin_lambda.setValue(self.wavelength*1e9)
+        h1.addWidget(self.spin_lambda)
+
+        # area
+        h2 = QHBoxLayout()
+        h2.addWidget(QLabel("FOV side length [mm]"))
+        self.spin_area = QDoubleSpinBox()
+        self.spin_area.setDecimals(6)
+        self.spin_area.setRange(0.01, 100.0)
+        self.spin_area.setValue(self.area*1e3)
+        h2.addWidget(self.spin_area)
+
+        # N
+        h3 = QHBoxLayout()
+        h3.addWidget(QLabel("Grid size N (square)"))
+        self.spin_N = QSpinBox()
+        self.spin_N.setRange(64, 4096)
+        self.spin_N.setValue(self.N)
+        h3.addWidget(self.spin_N)
+
+        # z manual
+        h4 = QHBoxLayout()
+        h4.addWidget(QLabel("z [mm]"))
+        self.spin_z = QDoubleSpinBox()
+        self.spin_z.setDecimals(6)
+        self.spin_z.setRange(0.001, 100.0)
+        self.spin_z.setValue(self.z*1e3)
+        h4.addWidget(self.spin_z)
+
+        # propagator
+        h5 = QHBoxLayout()
+        h5.addWidget(QLabel("Propagation method"))
+        self.combo_prop = QComboBox()
+        self.combo_prop.addItems(["Angular Spectrum", "Fresnel"])
+        h5.addWidget(self.combo_prop)
+
+        # autofocus controls
+        self.combo_focus_metric = QComboBox()
+        self.combo_focus_metric.addItems(["Unwrapped phase range", "Laplacian variance"])
+        h6 = QHBoxLayout()
+        h6.addWidget(QLabel("Autofocus metric"))
+        h6.addWidget(self.combo_focus_metric)
+
+        self.spin_zmin = QDoubleSpinBox(); self.spin_zmin.setDecimals(6); self.spin_zmin.setRange(0.001, 100.0); self.spin_zmin.setValue(0.05)
+        self.spin_zmax = QDoubleSpinBox(); self.spin_zmax.setDecimals(6); self.spin_zmax.setRange(0.001, 100.0); self.spin_zmax.setValue(10.0)
+        self.spin_zstep= QDoubleSpinBox(); self.spin_zstep.setDecimals(6); self.spin_zstep.setRange(0.0001, 10.0); self.spin_zstep.setValue(0.05)
+        hz = QHBoxLayout()
+        hz.addWidget(QLabel("z min [mm]")); hz.addWidget(self.spin_zmin)
+        hz.addWidget(QLabel("z max [mm]")); hz.addWidget(self.spin_zmax)
+        hz.addWidget(QLabel("z step [mm]")); hz.addWidget(self.spin_zstep)
+
+        btn_autofocus = QPushButton("Autofocus (scan)")
+        btn_autofocus.clicked.connect(self.autofocus)
+
+        # reconstruct button
+        btn_recon = QPushButton("Reconstruct @ z")
+        btn_recon.clicked.connect(self.reconstruct)
+
+        lay.addLayout(h1); lay.addLayout(h2); lay.addLayout(h3)
+        lay.addLayout(h4); lay.addLayout(h5); lay.addLayout(h6); lay.addLayout(hz)
+        lay.addWidget(btn_autofocus)
+        lay.addWidget(btn_recon)
+        lay.addStretch()
+        self.tabs.addTab(tab, "Propagation")
+
+    def _build_tab_iter(self):
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+
+        # method
+        h0 = QHBoxLayout()
+        h0.addWidget(QLabel("Iterative method"))
+        self.combo_iter_method = QComboBox()
+        self.combo_iter_method.addItems(["GS", "HIO"])
+        h0.addWidget(self.combo_iter_method)
+
+        # iter count, beta
+        h1 = QHBoxLayout()
+        h1.addWidget(QLabel("Max iterations"))
+        self.spin_iters = QSpinBox(); self.spin_iters.setRange(1, 2000); self.spin_iters.setValue(50)
+        h1.addWidget(self.spin_iters)
+
+        h1b = QHBoxLayout()
+        h1b.addWidget(QLabel("HIO beta"))
+        self.spin_beta = QDoubleSpinBox(); self.spin_beta.setDecimals(3); self.spin_beta.setRange(0.0, 1.0); self.spin_beta.setValue(0.9)
+        h1b.addWidget(self.spin_beta)
+
+        # positivity
+        self.chk_pos = QCheckBox("Enforce positivity (amplitude)")
+        self.chk_pos.setChecked(True)
+
+        # support
+        h2 = QHBoxLayout()
+        h2.addWidget(QLabel("Support mode"))
+        self.combo_support = QComboBox()
+        self.combo_support.addItems(["percentile", "otsu", "fixed"])
+        h2.addWidget(self.combo_support)
+
+        h3 = QHBoxLayout()
+        h3.addWidget(QLabel("Support percentile / fixed thr."))
+        self.spin_support_val = QDoubleSpinBox(); self.spin_support_val.setDecimals(3)
+        self.spin_support_val.setRange(0.0, 100000.0); self.spin_support_val.setValue(90.0)
+        h3.addWidget(self.spin_support_val)
+
+        h4 = QHBoxLayout()
+        h4.addWidget(QLabel("Dilation radius (px)"))
+        self.spin_dilation = QSpinBox(); self.spin_dilation.setRange(0, 100); self.spin_dilation.setValue(2)
+        h4.addWidget(self.spin_dilation)
+
+        self.chk_adapt = QCheckBox("Adaptive support threshold")
+        self.chk_adapt.setChecked(True)
+
+        lay.addLayout(h0); lay.addLayout(h1); lay.addLayout(h1b)
+        lay.addWidget(self.chk_pos)
+        lay.addLayout(h2); lay.addLayout(h3); lay.addLayout(h4)
+        lay.addWidget(self.chk_adapt)
+        lay.addStretch()
+        self.tabs.addTab(tab, "Iterative")
+
+    def _build_tab_viz_export(self):
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+
+        self.chk_link_color = QCheckBox("Link color scales (amp/phase)")
+        self.chk_link_color.setChecked(True)
+
+        self.chk_save_npz = QCheckBox("Save NPZ fields on export")
+        self.chk_save_npz.setChecked(True)
+
+        self.chk_save_params = QCheckBox("Save JSON params on export")
+        self.chk_save_params.setChecked(True)
+
+        self.chk_save_metrics = QCheckBox("Save CSV metrics on export")
+        self.chk_save_metrics.setChecked(True)
+
+        hfmt = QHBoxLayout()
+        hfmt.addWidget(QLabel("Export base name"))
+        self.edit_basename = QLineEdit("recon")
+        hfmt.addWidget(self.edit_basename)
+
+        btn_export = QPushButton("Export Figure + Data")
+        btn_export.clicked.connect(self.export_all)
+
+        lay.addWidget(self.chk_link_color)
+        lay.addWidget(self.chk_save_npz)
+        lay.addWidget(self.chk_save_params)
+        lay.addWidget(self.chk_save_metrics)
+        lay.addLayout(hfmt)
+        lay.addWidget(btn_export)
+        lay.addStretch()
+        self.tabs.addTab(tab, "Viz & Export")
+
+    # --------------- Actions ----------------
+
+    def load_hologram(self):
+        fname, _ = QFileDialog.getOpenFileName(self, "Open Hologram", "", "Images (*.png *.jpg *.bmp *.tif *.tiff)")
+        if not fname:
+            return
+        img = np.array(Image.open(fname)).astype(np.float64)
+        if img.ndim == 3:
+            img = img[..., 0]  # take first channel
+        # normalize to [0, max]
+        img = img - img.min()
+        if img.max() > 0:
+            img = img / img.max()
+        # extrapolate if needed
+        factor = int(self.spin_extrap.value())
+        mode = self.combo_extrap.currentText().lower()
+        Nx, Ny = img.shape
+        N = int(np.ceil(max(Nx, Ny) * factor / 2) * 2)  # even
+        pad = np.zeros((N, N), dtype=np.float64)
+        if mode == "random":
+            pad[:] = np.random.RandomState(0).rand(N, N) * img.mean()
+        sx = (N - Nx)//2; sy = (N - Ny)//2
+        pad[sx:sx+Nx, sy:sy+Ny] = img
+        self.hologram = pad
+        self.filtered = None
+        # update internal params
+        self.N = int(self.spin_N.value())
+        # snap N to hologram size if extrapolated
+        self.N = max(self.N, N)
+        self.spin_N.setValue(self.N)
+        QMessageBox.information(self, "Loaded", f"Loaded hologram: {fname}\nShape: {img.shape} -> padded {pad.shape}")
+
+    def apply_filter(self):
+        if self.hologram is None:
+            QMessageBox.warning(self, "Warning", "Load a hologram first.")
+            return
+        self.filtered = twin_image_sideband_filter(self.hologram)
+        QMessageBox.information(self, "Filter", "Twin-image filtering done.")
+
+    def autofocus(self):
+        if self.hologram is None:
+            QMessageBox.warning(self, "Warning", "Load a hologram first.")
+            return
+        use = self.filtered if self.filtered is not None else self.hologram
+        N = int(self.spin_N.value())
+        L = float(self.spin_area.value()) * 1e-3
+        dx = L / N
+        lam = float(self.spin_lambda.value()) * 1e-9
+
+        method = self.combo_prop.currentText()
+        metric_name = self.combo_focus_metric.currentText()
+
+        zmin = float(self.spin_zmin.value()) * 1e-3
+        zmax = float(self.spin_zmax.value()) * 1e-3
+        zstep = float(self.spin_zstep.value()) * 1e-3
+        zs = np.arange(zmin, zmax + 0.5*zstep, zstep)
+
+        # choose kernel maker
+        def kernel(z):
+            if method == "Angular Spectrum":
+                return angular_spectrum_kernel(N, lam, dx, z, evanescent="zero")
+            else:
+                return fresnel_kernel(N, lam, dx, z)
+
+        X = fft2c(resize_or_pad(use, (N, N)))
+        best_val, best_z = -np.inf, None
+
+        for z in zs:
+            H = kernel(z)
+            field = ifft2c(X * H)
+            val = autofocus_metric(field, "phase_range" if "phase" in metric_name.lower() else "laplacian")
+            if val > best_val:
+                best_val, best_z = val, z
+
+        self.z = best_z
+        self.spin_z.setValue(best_z * 1e3)
+        QMessageBox.information(self, "Autofocus",
+                                f"Best z = {best_z*1e3:.3f} mm | metric = {best_val:.4f}")
+        self.reconstruct()
+
+    def reconstruct(self):
+        if self.hologram is None:
+            QMessageBox.warning(self, "Warning", "Load a hologram first.")
+            return
+
+        # params
+        self.N = int(self.spin_N.value())
+        self.area = float(self.spin_area.value()) * 1e-3
+        self.wavelength = float(self.spin_lambda.value()) * 1e-9
+        self.z = float(self.spin_z.value()) * 1e-3
+        dx = self.area / self.N
+
+        # select image
+        holo = self.filtered if self.filtered is not None else self.hologram
+        Himg = resize_or_pad(holo, (self.N, self.N))
+        HFT = fft2c(Himg)
+
+        # kernels
+        if self.combo_prop.currentText() == "Angular Spectrum":
+            Hfwd = angular_spectrum_kernel(self.N, self.wavelength, dx, self.z, evanescent="zero")
+            Hbwd = angular_spectrum_kernel(self.N, self.wavelength, dx, -self.z, evanescent="zero")
+        else:
+            Hfwd = fresnel_kernel(self.N, self.wavelength, dx, self.z)
+            Hbwd = fresnel_kernel(self.N, self.wavelength, dx, -self.z)
+
+        # direct
+        Fdir = ifft2c(HFT * Hfwd)
+        amp_d = np.abs(Fdir)
+        wrp_d = np.angle(Fdir)
+        uwp_d = unwrap_phase(wrp_d)
+
+        # iterative settings
+        itset = IterSettings(
+            method=self.combo_iter_method.currentText(),
+            max_iter=int(self.spin_iters.value()),
+            beta=float(self.spin_beta.value()),
+            positivity=self.chk_pos.isChecked(),
+            support_mode=self.combo_support.currentText(),
+            support_thresh=float(self.spin_support_val.value()),
+            support_percentile=float(self.spin_support_val.value()),
+            dilation=int(self.spin_dilation.value()),
+            adaptive_support=self.chk_adapt.isChecked(),
+            adaptive_rate=0.97
+        )
+
+        holo_amp = np.sqrt(np.clip(Himg, 0, None))
+        Fiter, sup = iterative_reconstruction(holo_amp, Hfwd, Hbwd, itset)
+        self.support = sup
+        amp_i = np.abs(Fiter)
+        wrp_i = np.angle(Fiter)
+        uwp_i = unwrap_phase(wrp_i)
+
+        # diffs
+        diff_amp = amp_i - amp_d
+        diff_wr = wrap_to_pi(wrp_i - wrp_d)
+        diff_uw = uwp_i - uwp_d
+
+        # FFT magnitudes (object plane)
+        fftD_mag = np.log1p(np.abs(fft2c(Fdir)))
+        fftI_mag = np.log1p(np.abs(fft2c(Fiter)))
+
+        # Plot grid
+        self.canvas.plot_all(
+            amp_d, wrp_d, uwp_d,
+            amp_i, wrp_i, uwp_i,
+            diff_amp, diff_wr, diff_uw,
+            fftD_mag, fftI_mag, wrp_i,
+            link_color=self.chk_link_color.isChecked()
+        )
+
+        # store fields
+        self.direct_field = Fdir
+        self.iter_field = Fiter
+
+        # metrics
+        m = compute_metrics(amp_d, amp_i, uwp_d, uwp_i, self.support)
+        self.update_metrics_table(m)
+
+    def update_metrics_table(self, metrics_dict):
+        self.metrics_table.setRowCount(0)
+        for k, v in metrics_dict.items():
+            r = self.metrics_table.rowCount()
+            self.metrics_table.insertRow(r)
+            self.metrics_table.setItem(r, 0, QTableWidgetItem(k))
+            self.metrics_table.setItem(r, 1, QTableWidgetItem(f"{v:.6g}" if isinstance(v, (float, np.floating)) else str(v)))
+
+    def update_profiles(self, x, y):
+        # Draw line profiles through (y, x)
+        if self.direct_field is None or self.iter_field is None:
+            return
+        D = self.direct_field
+        I = self.iter_field
+        N, M = D.shape
+        x = np.clip(x, 0, M-1)
+        y = np.clip(y, 0, N-1)
+
+        # Extract profiles
+        Ad = np.abs(D); Ai = np.abs(I)
+        Pd = np.angle(D); Pi = np.angle(I)
+        Ud = unwrap_phase(Pd); Ui = unwrap_phase(Pi)
+
+        row = slice(None)
+        col = slice(None)
+        amp_row_d = Ad[y, :]
+        amp_row_i = Ai[y, :]
+        amp_col_d = Ad[:, x]
+        amp_col_i = Ai[:, x]
+
+        # Re-plot small figure: 2x2 (row/col for amplitude & unwrapped)
+        self.profiles_fig.clf()
+        ax1 = self.profiles_fig.add_subplot(2,2,1); ax2 = self.profiles_fig.add_subplot(2,2,2)
+        ax3 = self.profiles_fig.add_subplot(2,2,3); ax4 = self.profiles_fig.add_subplot(2,2,4)
+
+        ax1.plot(amp_row_d, label="Dir"); ax1.plot(amp_row_i, '--', label="Iter")
+        ax1.set_title(f"Amp Row y={y}"); ax1.legend(); ax1.grid(True)
+        ax2.plot(amp_col_d, label="Dir"); ax2.plot(amp_col_i, '--', label="Iter")
+        ax2.set_title(f"Amp Col x={x}"); ax2.legend(); ax2.grid(True)
+
+        ax3.plot(Ud[y, :], label="Dir"); ax3.plot(Ui[y, :], '--', label="Iter")
+        ax3.set_title("Unwrapped Row"); ax3.legend(); ax3.grid(True)
+        ax4.plot(Ud[:, x], label="Dir"); ax4.plot(Ui[:, x], '--', label="Iter")
+        ax4.set_title("Unwrapped Col"); ax4.legend(); ax4.grid(True)
+
+        self.profiles_fig.tight_layout()
+        self.profiles_canvas.draw()
+
+    def export_all(self):
+        if self.direct_field is None or self.iter_field is None:
+            QMessageBox.warning(self, "Warning", "Reconstruct first.")
+            return
+        base = self.edit_basename.text().strip() or "recon"
+        # figure
+        fig_path = ask_save(self, f"{base}.png", "PNG (*.png);;TIFF (*.tif *.tiff)")
+        if not fig_path:
+            return
+        self.canvas.fig.savefig(fig_path, dpi=300)
+        # npz
+        if self.chk_save_npz.isChecked():
+            np.savez_compressed(
+                fpath_with_new_ext(fig_path, ".npz"),
+                direct=self.direct_field.astype(np.complex64),
+                iterative=self.iter_field.astype(np.complex64),
+                support=self.support.astype(np.uint8) if self.support is not None else None
+            )
+        # params
+        if self.chk_save_params.isChecked():
+            params = {
+                "N": self.N,
+                "area_m": self.area,
+                "dx_m": self.area / self.N,
+                "wavelength_m": self.wavelength,
+                "z_m": self.z,
+                "propagation": self.combo_prop.currentText()
+            }
+            with open(fpath_with_new_ext(fig_path, ".json"), "w", encoding="utf-8") as f:
+                json.dump(params, f, indent=2)
+        # metrics
+        if self.chk_save_metrics.isChecked():
+            # reconstruct metrics dict from table
+            metrics = {}
+            for r in range(self.metrics_table.rowCount()):
+                k = self.metrics_table.item(r, 0).text()
+                v = self.metrics_table.item(r, 1).text()
+                metrics[k] = v
+            save_csv_dict(metrics, fpath_with_new_ext(fig_path, ".csv"))
+        QMessageBox.information(self, "Export", f"Saved outputs with base: {fig_path}")
+
+# -------------------------------
+# Utilities
+# -------------------------------
+
+def resize_or_pad(img, shape):
+    """
+    If img is smaller than shape, center-pad with zeros.
+    If larger, center-crop.
+    """
+    N, M = shape
+    h, w = img.shape
+    out = np.zeros((N, M), dtype=img.dtype)
+
+    # target window
+    if h <= N:
+        sy = (N - h)//2; ey = sy + h
+        ys = 0; ye = h
+    else:
+        sy = 0; ey = N
+        ys = (h - N)//2; ye = ys + N
+
+    if w <= M:
+        sx = (M - w)//2; ex = sx + w
+        xs = 0; xe = w
+    else:
+        sx = 0; ex = M
+        xs = (w - M)//2; xe = xs + M
+
+    out[sy:ey, sx:ex] = img[ys:ye, xs:xe]
+    return out
+
+def wrap_to_pi(phase):
+    return (phase + np.pi) % (2*np.pi) - np.pi
+
+def ask_save(parent, default_name, filter_spec):
+    path, _ = QFileDialog.getSaveFileName(parent, "Save As", default_name, filter_spec)
+    return path
+
+def fpath_with_new_ext(path, new_ext):
+    import os
+    root, _ = os.path.splitext(path)
+    return root + new_ext
+
+def save_csv_dict(d, path):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("metric,value\n")
+        for k, v in d.items():
+            f.write(f"{k},{v}\n")
+
+# -------------------------------
+# Entry
+# -------------------------------
 
 def main():
     app = QApplication(sys.argv)
-    window = HoloReconstructionApp()
-    window.show()
+    w = HoloGUI()
+    w.resize(1400, 900)
+    w.show()
     sys.exit(app.exec_())
 
 if __name__ == "__main__":
